@@ -15,12 +15,14 @@ import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 
 contract TakeProfitsHook is BaseHook, ERC1155 {
     // Use the PoolIdLibrary for PoolKey to add the `.toId()` function on a PoolKey
     // which hashes the PoolKey struct into a bytes32 value
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+    using FixedPointMathLib for uint256;
 
     // Create a mapping to store the last known tickLower value for a given Pool
     mapping(PoolId poolId => int24 tickLower) public tickLowerLasts;
@@ -424,6 +426,94 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
     // If we did not return by now, there are no orders possibly left to fulfill within the range
     // Return `false` and the currentTickLower value
     return (false, currentTickLower);
+  }
+  
+  //Trigger: Called after any swap in the pool.
+  //Re-entrancy Check: Avoids recursive calls from the hook's own swaps.
+  //Order Processing:
+  //Scans ticks for take-profit orders in the opposite direction of the swap.
+  //Executes orders if the price reaches their specified levels.
+  //State Tracking: Updates the last processed tick to resume scanning later.
+  function afterSwap(
+    address addr,
+    PoolKey calldata key,
+    IPoolManager.SwapParams calldata params,
+    BalanceDelta,
+    bytes calldata
+   ) external override poolManagerOnly returns (bytes4) {
+    // Every time we fulfill an order, we do a swap
+    // So it creates an `afterSwap` call back to ourselves
+    // This opens us up for re-entrancy attacks
+    // So if we detect we are calling ourselves, we return early and don't try to fulfill any orders
+    if (addr == address(this)) {
+        return TakeProfitsHook.afterSwap.selector;
+    }
+
+    bool attemptToFillMoreOrders = true;
+    int24 currentTickLower;
+
+    // While we have any possibility of having orders left to fulfill
+    while (attemptToFillMoreOrders) {
+        // Try fulfilling orders
+        (attemptToFillMoreOrders, currentTickLower) = _tryFulfillingOrders(
+            key,
+            params
+        );
+        // Update `tickLowerLasts` to have the value of `currentTickLower` after the last iteration
+        tickLowerLasts[key.toId()] = currentTickLower;
+    }
+
+    return TakeProfitsHook.afterSwap.selector;
+   }
+
+   // redeem function allows users to withdraw thier swapped tokens if thier order gets filled.
+   // the user will request to receive a certain amount of swapped tokens back by returning ERC-1155 tokens representing the amount of tokens they put in to be sold through the order.
+   // Since multiple people could have added tokens to the same order, or the user who created the order could've traded away some of the ERC-1155 tokens, we need to calculate how many swapped tokens are earmarked for this user:
+   // Assuming the user can present a certain amountIn worth of ERC-1155 tokens, then their share of tokens contributed to the total order is equal to
+   // user's share = amount put in by user / total tokens part of this order to be sold ⇒  usersShare = amountIn / tokenIdTotalSupply[tokenId]
+   // Then, the amount of swapped tokens the user has claim over is equal to amountToSend = usersShare * tokenIdClaimable[tokenId]
+   //Therefore, amountToSend = (amountIn / tokenIdTotalSupply[tokenId]) * tokenIdClaimable[tokenId]
+   
+   function redeem(
+    uint256 tokenId,
+    uint256 amountIn,
+    address destination
+   ) external {
+    // Make sure there is something to claim
+    require(
+        tokenIdClaimable[tokenId] > 0,
+        "TakeProfitsHook: No tokens to redeem"
+    );
+
+    // Make sure user has enough ERC-1155 tokens to redeem the amount they're requesting
+    uint256 balance = balanceOf(msg.sender, tokenId);
+    require(
+        balance >= amountIn,
+        "TakeProfitsHook: Not enough ERC-1155 tokens to redeem requested amount"
+    );
+
+    TokenData memory data = tokenIdData[tokenId];
+    Currency tokenToSend = data.zeroForOne
+        ? data.poolKey.currency1
+        : data.poolKey.currency0;
+
+    // multiple people could have added tokens to the same order, so we need to calculate the amount to send
+    // total supply = total amount of tokens that were part of the order to be sold
+    // therefore, user's share = (amountIn / total supply)
+    // therefore, amount to send to user = (user's share * total claimable)
+
+    // amountToSend = amountIn * (total claimable / total supply)
+    // We use FixedPointMathLib.mulDivDown to avoid rounding errors
+    uint256 amountToSend = amountIn.mulDivDown(
+        tokenIdClaimable[tokenId],
+        tokenIdTotalSupply[tokenId]
+    );
+
+    tokenIdClaimable[tokenId] -= amountToSend;
+    tokenIdTotalSupply[tokenId] -= amountIn;
+    _burn(msg.sender, tokenId, amountIn);
+
+    tokenToSend.transfer(destination, amountToSend);
   }
 }
 
