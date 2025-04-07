@@ -434,6 +434,16 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
   //Scans ticks for take-profit orders in the opposite direction of the swap.
   //Executes orders if the price reaches their specified levels.
   //State Tracking: Updates the last processed tick to resume scanning later.
+  // Arguments explained:
+  // address addr – The address that initiated the swap.
+  // PoolKey calldata key – Stores information about the liquidity pool where the swap took place (e.g., token pair, fee structure).
+  // IPoolManager.SwapParams calldata params – Contains parameters about the swap, such as:
+  // zeroForOne (whether the swap is token0 → token1 or vice versa)
+  // amountSpecified (how much of the token is being swapped)
+  // sqrtPriceLimitX96 (price impact limits)
+  // BalanceDelta – Represents how balances have changed due to the swap (not explicitly used in this function).
+  // bytes calldata – Extra optional data for custom use cases (not used here).
+
   function afterSwap(
     address addr,
     PoolKey calldata key,
